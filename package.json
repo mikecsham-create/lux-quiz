@@ -12,11 +12,17 @@
     "test": "echo \"No test specified\" && exit 0",
     "dev": "quasar dev",
     "build": "quasar build",
+    "serve:prod": "node server/index.cjs",
     "postinstall": "quasar prepare"
   },
   "dependencies": {
     "@quasar/extras": "^1.16.4",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "helmet": "^8.1.0",
     "pinia": "^3.0.1",
+    "pino": "^9.11.0",
+    "pino-pretty": "^13.1.1",
     "quasar": "^2.16.0",
     "vue": "3.5.20",
     "vue-router": "^4.0.12"
