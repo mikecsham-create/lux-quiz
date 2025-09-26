@@ -1,6 +1,6 @@
 // Hardened prod server for /dist/spa with CSP (report-only), logging, rate limiting,
-// health check, error handling, request IDs, CSP report validation, graceful shutdown,
-// and sensible static caching (CommonJS).
+// request IDs, health check, error handling, graceful shutdown, and static caching.
+// CommonJS (because project is ESM and we run this via node server/index.cjs)
 
 const express = require("express");
 const path = require("path");
@@ -38,7 +38,7 @@ app.use((req, res, next) => {
 app.use(
   helmet({
     contentSecurityPolicy: false, // we set our own Report-Only header below
-    crossOriginEmbedderPolicy: false, // SPA libs sometimes break with COEP on
+    crossOriginEmbedderPolicy: false, // some SPA libs break with COEP enabled
   })
 );
 
@@ -53,14 +53,14 @@ const cspLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// ---- CSP (Report-Only) ----------------------------------------------------
+// ---- Apply CSP (always enforce) ----
 app.use((req, res, next) => {
   const cspDirectives = [
     "default-src 'self'",
     "base-uri 'self'",
     "object-src 'none'",
     "img-src 'self' data: blob:",
-    "font-src 'self'",
+    "font-src 'self' data:",
     "style-src 'self' 'unsafe-inline'", // move toward nonces/hashes later
     "script-src 'self'",                // consider nonces once inline removed
     "connect-src 'self'",
@@ -70,18 +70,61 @@ app.use((req, res, next) => {
     "frame-ancestors 'none'",
     "manifest-src 'self'",
     "upgrade-insecure-requests",
+    "child-src 'none'",
+    "trusted-types vue",
     "report-uri /__cspreport__",
   ].join("; ");
-
-  res.setHeader("Content-Security-Policy-Report-Only", cspDirectives);
+  
+  res.removeHeader("Content-Security-Policy-Report-Only");
+  res.setHeader("Content-Security-Policy", cspDirectives);
   next();
 });
 
 // ---- CSP report validation ------------------------------------------------
 const validateCSPReport = (body) =>
   body &&
-  (body["csp-report"] && typeof body["csp-report"] === "object" ||
-   body["csp_report"] && typeof body["csp_report"] === "object"); // some UAs underscore
+  ((body["csp-report"] && typeof body["csp-report"] === "object") ||
+    (body["csp_report"] && typeof body["csp_report"] === "object")); // some UAs underscore
+
+// ---- CSP violation tracking ----------------------------------------------
+// Track by violation type for better debugging
+const violationStats = {
+  total: 0,
+  byDirective: new Map()
+};
+
+function logViolation(violation) {
+  const v = violation["csp-report"] || violation["csp_report"] || violation;
+  const directive = v?.["violated-directive"] || "unknown";
+  
+  violationStats.total += 1;
+  violationStats.byDirective.set(
+    directive, 
+    (violationStats.byDirective.get(directive) || 0) + 1
+  );
+  
+  logger.warn({
+    blockedURI: v?.["blocked-uri"],
+    violatedDirective: directive,
+    documentURI: v?.["document-uri"],
+    effectiveDirective: v?.["effective-directive"],
+    ts: new Date().toISOString(),
+  }, "CSP Violation");
+}
+
+setInterval(() => {
+  if (violationStats.total > 0) {
+    const summary = {
+      total: violationStats.total,
+      byDirective: Object.fromEntries(violationStats.byDirective)
+    };
+    logger.info(summary, "CSP violations summary (last hour)");
+    
+    // Reset
+    violationStats.total = 0;
+    violationStats.byDirective.clear();
+  }
+}, 60 * 60 * 1000);
 
 // ---- CSP violation receiver ----------------------------------------------
 app.post("/__cspreport__", cspLimiter, (req, res, next) => {
@@ -90,7 +133,7 @@ app.post("/__cspreport__", cspLimiter, (req, res, next) => {
       logger.warn({ reqId: req.id, body: req.body }, "Invalid CSP report payload");
       return res.status(400).json({ error: "invalid csp report" });
     }
-    logger.warn({ reqId: req.id, violation: req.body }, "CSP Violation");
+    logViolation(req.body);
     res.status(204).end();
   } catch (err) {
     next(err);
@@ -104,7 +147,10 @@ app.get("/health", (_req, res) => {
 
 // ---- Static asset caching -------------------------------------------------
 const distSpa = path.join(__dirname, "..", "dist", "spa");
+
+// Serve SPA under /quiz first (so assets like /quiz/assets/*.css resolve correctly)
 app.use(
+  "/quiz",
   express.static(distSpa, {
     maxAge: "1d",
     etag: true,
@@ -118,12 +164,17 @@ app.use(
   })
 );
 
-// ---- History-mode fallback ------------------------------------------------
-app.get("*", (_req, res) => {
+// Use regex to avoid path-to-regexp parsing issues
+app.get(/^\/quiz\/.*/, (_req, res) => {
   res.sendFile(path.join(distSpa, "index.html"));
 });
 
-// ---- Error handler (complete) --------------------------------------------
+// Optional: redirect root → /quiz/
+app.get("/", (_req, res) => {
+  res.redirect("/quiz/");
+});
+
+// ---- Error handler (must be last) ----------------------------------------
 app.use((err, req, res, _next) => {
   logger.error({ reqId: req.id, err, path: req.path }, "Unhandled server error");
   res.status(500).json({ error: "Internal Server Error" });
